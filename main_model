@@ -1,0 +1,131 @@
+# ==============================================================================
+# Interrupted Time Series (ITS) Analysis
+# Tropical cyclones and diarrhoeal disease in Taiwan, 2010-2019
+#
+# This script fits event-specific ITS models using a single global
+# quasi-Poisson model specification for all 19 TC events.
+#
+# Input:  one .rds file per TC event (weekly diarrhoeal cases + covariates)
+# Output: excess case estimates for each event (point estimate + 95% CI)
+# ==============================================================================
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(splines)
+})
+
+# ----- Selected TC events -----
+selected_events <- c(
+  "201006_LIONROCK", "201011_FANAPI",   "201013_MEGI",      "201111_NANMADOL",
+  "201205_TALIM",    "201214_TEMBIN",   "201307_SOULIK",    "201312_TRAMI",
+  "201323_FITOW",    "201410_MATMO",    "201416_FUNG_WONG", "201513_SOUDELOR",
+  "201521_DUJUAN",   "201601_NEPARTAK", "201614_MERANTI",   "201709_NESAT",
+  "201808_MARIA",    "201911_BAILU",    "201918_MITAG"
+)
+
+# ----- Global ITS model specification -----
+# A single model formula is applied to all TC events.
+# - event:  binary indicator (1 = weeks 0-2 after TC warning, 0 = pre-event)
+# - time:   continuous week index, modelled with a natural cubic spline (df = 5)
+#           to capture long-term trends and seasonality
+# - t2m:    weekly mean 2-metre air temperature (°C), modelled with a natural
+#           cubic spline with internal knots at the 25th and 75th percentiles
+# - tp:     weekly non-TC precipitation (mm), modelled with a natural cubic
+#           spline with internal knots at the 25th and 75th percentiles
+fml_global <- as.formula(paste(
+  "cases ~ event + ns(time, df = 5)",
+  "+ ns(t2m, knots = quantile(t2m, c(0.25, 0.75), na.rm = TRUE))",
+  "+ ns(tp,  knots = quantile(tp,  c(0.25, 0.75), na.rm = TRUE))"
+))
+
+# ----- Input files -----
+# See data access instructions in the README.
+in_dir    <- "data/001_df_analysis"
+rds_files <- list.files(in_dir, pattern = "\\.rds$", full.names = TRUE)
+rds_files <- rds_files[tools::file_path_sans_ext(basename(rds_files)) %in% selected_events]
+if (!length(rds_files)) stop("No matching RDS files found in ", in_dir)
+
+# ----- Fit models and estimate excess cases -----
+excess_rows <- list()
+
+for (f in rds_files) {
+  base <- tools::file_path_sans_ext(basename(f))
+  message("Processing: ", base)
+
+  dat <- tryCatch(readRDS(f), error = function(e) NULL)
+  if (is.null(dat)) next
+
+  # Prepare time index and event window indicator
+  dat <- dat %>%
+    arrange(yrwk) %>%
+    mutate(
+      is_zero  = !is.na(relative_week) & relative_week == 0,
+      event_id = cumsum(ifelse(is_zero, 1L, 0L)),
+      time     = if ("time" %in% names(.)) time else dplyr::row_number()
+    )
+
+  df_e <- dat %>%
+    mutate(
+      in_event = (event_id == 1L) & !is.na(relative_week) & (relative_week %in% 0:2),
+      event    = as.integer(in_event)
+    )
+
+  this_tc <- if ("tc_event" %in% names(df_e)) unique(df_e$tc_event)[1] else NA_character_
+
+  # Skip if insufficient data (minimum 12 pre-event and 3 post-event weeks)
+  n_pre  <- df_e %>% filter(relative_week <  0) %>% summarise(n = sum(!is.na(cases))) %>% pull(n)
+  n_post <- df_e %>% filter(relative_week >= 0) %>% summarise(n = sum(!is.na(cases))) %>% pull(n)
+  if (is.na(n_pre) || is.na(n_post) || n_pre < 12 || n_post < 3) {
+    message("  (Insufficient pre/post data; skipping)")
+    next
+  }
+
+  # Covariate guards (fill with 0 if missing)
+  if (!"t2m" %in% names(df_e)) df_e <- mutate(df_e, t2m = 0)
+  if (!"tp"  %in% names(df_e)) df_e <- mutate(df_e, tp  = 0)
+
+  # Fit quasi-Poisson ITS model
+  fit <- tryCatch(
+    glm(fml_global, family = quasipoisson, data = df_e, na.action = na.exclude),
+    error = function(e) NULL
+  )
+  if (is.null(fit)) { message("  (Model failed; skipping)"); next }
+
+  # Counterfactual prediction (what would have happened without the TC)
+  newdat <- df_e[, c("time","event","yrwk","t2m","tp","cases","relative_week","event_id","in_event")]
+  p0 <- predict(fit, type = "link", newdata = transform(newdat, event = 0), se.fit = TRUE)
+
+  df_e <- df_e %>%
+    mutate(
+      pred_cf       = exp(p0$fit),
+      pred_cf_lower = exp(p0$fit - 1.96 * p0$se.fit),
+      pred_cf_upper = exp(p0$fit + 1.96 * p0$se.fit)
+    )
+
+  # Excess cases = observed - counterfactual, summed over event window (weeks 0-2)
+  ev <- df_e %>% filter(in_event)
+  if (nrow(ev) == 0L || all(is.na(ev$cases)) || all(is.na(ev$pred_cf))) {
+    message("  (No event window data; skipping)")
+    next
+  }
+  excess_est  <- sum(ev$cases, na.rm = TRUE) - sum(ev$pred_cf,       na.rm = TRUE)
+  excess_low  <- sum(ev$cases, na.rm = TRUE) - sum(ev$pred_cf_upper, na.rm = TRUE)
+  excess_high <- sum(ev$cases, na.rm = TRUE) - sum(ev$pred_cf_lower, na.rm = TRUE)
+
+  s_yrwk <- df_e %>% filter(relative_week == 0) %>% slice(1) %>% pull(yrwk)
+  e_yrwk <- df_e %>% filter(relative_week == 2) %>% slice(1) %>% pull(yrwk)
+
+  excess_rows[[length(excess_rows) + 1L]] <- tibble::tibble(
+    tc_event    = this_tc,
+    start_yrwk  = s_yrwk,
+    end_yrwk    = e_yrwk,
+    excess_est  = as.integer(round(excess_est)),
+    excess_low  = as.integer(round(excess_low)),
+    excess_high = as.integer(round(excess_high))
+  )
+
+  message(sprintf("  Excess: %.0f (%.0f, %.0f)", excess_est, excess_low, excess_high))
+}
+
+# ----- Combine results -----
+excess_df <- dplyr::bind_rows(excess_rows)
+print(excess_df)
